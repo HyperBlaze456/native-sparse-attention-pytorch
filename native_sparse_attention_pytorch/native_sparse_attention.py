@@ -252,6 +252,7 @@ class SparseAttention(Module):
 
         self.split_compress_window = Rearrange('b h (w n) d -> b h w n d', n = compress_block_size)
 
+        self.num_mem_compress_kv = num_compressed_mem_kv
         self.compress_mem_kv = nn.Parameter(torch.zeros(2, kv_heads, num_compressed_mem_kv, dim_head))
 
         self.k_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, compress_block_size, dim_head))
@@ -315,13 +316,205 @@ class SparseAttention(Module):
 
         self.combine_heads = nn.Linear(dim_inner, dim, bias = False)
 
+    def forward_inference(
+        self,
+        inp,
+        cache,
+        return_cache = True
+    ):
+        # destruct cache
+
+        (
+            (cache_k, cache_v),
+            (
+                (cache_ck, cache_cv),
+                (run_k, run_v)
+            )
+         ) = cache
+
+        # variables
+
+        batch, scale, heads, device = inp.shape[0], self.scale, self.heads, inp.device
+        cache_len = cache_k.shape[-2]
+        seq_len = cache_len + 1
+
+        sliding_window = self.sliding_window_size
+        compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
+
+        fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
+        num_fine_blocks = fine_divisible_seq_len // self.selection_block_size
+
+        # maybe prenorm
+
+        inp = self.norm(inp)
+
+        # queries, keys, values
+
+        q, k, v = self.to_qkv(inp).split(self.qkv_split, dim = -1)
+
+        q, k, v = map(self.split_heads, (q, k, v))
+
+        # take care of running k and v for compression, which should NOT be rotated https://arxiv.org/abs/2501.18795
+
+        run_k = cat((run_k, k), dim = -2)
+        run_v = cat((run_v, v), dim = -2)
+
+        # rotate after updating the compression running k/v
+
+        rotated_q = self.rotary_emb.rotate_queries_or_keys(q, offset = cache_len)
+        k = self.rotary_emb.rotate_queries_or_keys(k, offset = cache_len)
+
+        # handle cache, which stores the rotated
+
+        k = cat((cache_k, k), dim = -2)
+        v = cat((cache_v, v), dim = -2)
+
+        if return_cache:
+            cache_kv = (k, v)
+
+        # 1. compressed attn inference
+
+        cq = q
+        ck = cache_ck
+        cv = cache_cv
+
+        repeated_ck = repeat(ck, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
+        repeated_cv = repeat(cv, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
+
+        csim = einsum(q, repeated_ck, 'b h i d, b h j d -> b h i j') * scale
+        cattn = csim.softmax(dim = -1)
+
+        compressed_attn_out = einsum(cattn, repeated_cv, 'b h i j, b h j d -> b h i d')
+
+        running_compress_seq_len = run_k.shape[-2]
+
+        if divisible_by(running_compress_seq_len, self.compress_block_size):
+
+            k_compress_input = self.split_compress_window(run_k + self.k_intrablock_positions)
+            v_compress_input = self.split_compress_window(run_v + self.v_intrablock_positions)
+
+            next_ck = self.k_compress(k_compress_input)
+            next_cv = self.v_compress(v_compress_input)
+
+            run_k = run_k[..., 0:0, :]
+            run_v = run_v[..., 0:0, :]
+
+            ck = cat((ck, next_ck), dim = -2)
+            cv = cat((cv, next_cv), dim = -2)
+
+        if return_cache:
+            cache_compressed_kv = ((ck, cv), (run_k, run_v))
+
+        # 2. fine attention inference (todo - compress and fine diff block sizes)
+
+        assert self.compress_block_size == self.selection_block_size
+
+        importance_scores = csim[..., self.num_mem_compress_kv:]
+        importance_scores += torch.randn_like(importance_scores) * 100
+
+        num_compress_blocks = importance_scores.shape[-1]
+        num_selected = min(self.num_selected_blocks, num_compress_blocks)
+        has_selected_kv_for_fine_attn = num_selected > 0
+
+        # block causal diagonal
+
+        fine_sliding_window = (seq_len % self.selection_block_size) + 1
+        fk = k[..., -fine_sliding_window:, :]
+        fv = v[..., -fine_sliding_window:, :]
+
+        # select out the sparse kv segments as defined by compressed attention map as importance score
+
+        if has_selected_kv_for_fine_attn:
+            if self.query_heads_share_selected_kv:
+                importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
+
+            sel_scores, sel_indices = importance_scores.topk(num_selected, dim = -1)
+    
+            fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
+            remainder = fine_divisible_seq_len - k.shape[-2]
+
+            sel_fk = pad_at_dim(k, (0, remainder), dim = -2)
+            sel_fv = pad_at_dim(v, (0, remainder), dim = -2)
+
+            sel_fk = rearrange(sel_fk, 'b h (w j) d -> b h w j d', j = self.selection_block_size)
+            sel_fv = rearrange(sel_fv, 'b h (w j) d -> b h w j d', j = self.selection_block_size)
+
+            # get_at('b h [w] j d, b h 1 sel -> b h (sel j) d'
+
+            sel_indices = repeat(sel_indices, 'b h 1 sel -> b h sel j d', j = self.selection_block_size, d = sel_fk.shape[-1])
+
+            sel_fk = sel_fk.gather(2, sel_indices)
+            sel_fv = sel_fv.gather(2, sel_indices)
+
+            sel_fk, sel_fv = tuple(rearrange(t, 'b h sel j d -> b h (sel j) d') for t in (sel_fk, sel_fv))
+
+            fmask = sel_scores > 1e-10
+
+            fmask = repeat(fmask, 'b h i sel -> b h i (sel j)', j = self.selection_block_size)
+
+            fk = cat((sel_fk, fk), dim = -2)
+            fv = cat((sel_fv, fv), dim = -2)
+
+            fmask = F.pad(fmask, (0, fk.shape[-2] - fmask.shape[-1]), value = True)
+
+        # remove later
+
+        fq = rearrange(rotated_q, 'b (h gh) ... -> b h gh ...', gh = self.num_grouped_queries)
+
+        fsim = einsum(fq, fk, 'b h gh i d, b h j d -> b h gh i j') * scale
+
+        fsim = einx.where('b h i j, b h gh i j, -> b h gh i j', fmask, fsim, max_neg_value(fsim))
+
+        fattn = fsim.softmax(dim = -1)
+
+        fine_attn_out = einsum(fattn, fv, 'b h gh i j, b h j d -> b h gh i d')
+        fine_attn_out = rearrange(fine_attn_out, 'b h gh ... -> b (h gh) ...')
+
+        # 3. sliding window
+
+        k = repeat(k, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
+        v = repeat(v, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
+
+        sliding_slice = (Ellipsis, slice(-(sliding_window + 1), None), slice(None))
+
+        k, v  = k[sliding_slice], v[sliding_slice]
+
+        sim = einsum(rotated_q, k, 'b h i d, b h j d -> b h i j') * scale
+        attn = sim.softmax(dim = -1)
+        sliding_window_attn_out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+
+        # combine strategies
+
+        strategy_weighted_combine = self.to_strategy_combine(inp)
+
+        out = einsum(strategy_weighted_combine, stack([compressed_attn_out, fine_attn_out, sliding_window_attn_out]), 'b h n s, s b h n d -> b h n d')
+
+        # merge heads and combine them
+
+        out = self.merge_heads(out)
+
+        out = self.combine_heads(out)
+
+        if not return_cache:
+            return out
+
+        return out, (cache_kv, cache_compressed_kv)
+
     def forward(
         self,
         inp,
+        cache = None,
         disable_triton_kernel = False,
         sliding_window_flex_mask = None,
-        fine_selection_flex_mask = None
+        fine_selection_flex_mask = None,
+        return_cache = False
     ):
+        is_inferencing = exists(cache)
+
+        if is_inferencing:
+            assert inp.shape[1] == 1, 'input must be single tokens if inferencing with cache key values'
+            return self.forward_inference(inp, cache, return_cache = return_cache)
+
         batch, seq_len, scale, heads, device = *inp.shape[:2], self.scale, self.heads, inp.device
 
         compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
@@ -348,9 +541,15 @@ class SparseAttention(Module):
         k_compress_input = self.split_compress_window(k[..., :compress_divisible_seq_len, :] + k_pos)
         v_compress_input = self.split_compress_window(v[..., :compress_divisible_seq_len, :] + v_pos)
 
+        run_k = k[..., compress_divisible_seq_len:, :]
+        run_v = v[..., compress_divisible_seq_len:, :]
+
         cq = q
         ck = self.k_compress(k_compress_input)   # Equation (7) of the Native Sparse Attention paper
         cv = self.v_compress(v_compress_input)
+
+        if return_cache:
+            cache_compressed_kv = ((ck, cv), (run_k, run_v))
 
         # 1. coarse attention over compressed
 
@@ -371,7 +570,12 @@ class SparseAttention(Module):
 
         # for 2. and 3., will give them relative positions with rotary - compressed needs to be handled separately (even if they already have intra block absolute positions)
 
-        rotated_q, rotated_k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+        q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+
+        # handle cache
+
+        if return_cache:
+            cache_kv = (k, v)
 
         # 2. fine attention over selected based on compressed attention logits - variables prepended with `f` stands for the fine attention pathway
 
@@ -427,8 +631,8 @@ class SparseAttention(Module):
 
         # handle if number of total blocks is less than number to select for fine attention
 
-        fq = rotated_q
-        fk = rotated_k
+        fq = q
+        fk = k
         fv = v
 
         if has_selected_kv_for_fine_attn:
@@ -437,10 +641,10 @@ class SparseAttention(Module):
 
             selected_importance_values, selected_block_indices = importance_scores.topk(num_selected, dim = -1)
 
+            gates = None
+
             if self.use_diff_topk:
                 gates = straight_through(selected_importance_values, 1.)
-                gates = gates.cumprod(dim = -1)[..., -1]
-                gates = repeat(gates, 'b h ... -> b (h qh) ...', qh = fine_num_grouped_queries)
 
             if self.use_triton_kernel and not disable_triton_kernel:
 
@@ -452,10 +656,13 @@ class SparseAttention(Module):
                     fq, fk, fv,
                     self.selection_block_size,
                     selected_block_indices,
-                    fmask
+                    fmask,
+                    sel_scale = gates
                 )
 
             elif exists(fine_selection_flex_mask):
+                assert not self.use_diff_topk, 'differential topk is not available for flex attention'
+
                 # flex attention for the selection for fine attention
 
                 fine_block_mask = fine_selection_flex_mask(selected_block_indices, num_grouped_queries = fine_num_grouped_queries)
@@ -475,8 +682,8 @@ class SparseAttention(Module):
 
                     selected_block_indices = pad_at_dim(selected_block_indices, (0, remainder), value = 0, dim = -2)
 
-                    if self.use_diff_topk:
-                        gates = pad_at_dim(gates, (0, remainder), value = 1.)
+                    if exists(gates):
+                        gates = pad_at_dim(gates, (0, remainder), value = 0, dim = -2)
 
                 # handle block causal diagonal in the diagram, but run experiments without to see
 
@@ -511,6 +718,14 @@ class SparseAttention(Module):
                 fk = fk.gather(3, selected_block_indices)
                 fv = fv.gather(3, selected_block_indices)
 
+                # differential topk gating
+
+                if self.use_diff_topk:
+                    gates = F.pad(gates, (0, 1), value = 1.)
+                    fk = einx.multiply('b h i sel, b h i sel j d -> b h i sel j d', gates, fk)
+
+                # merge selected key values
+
                 fk, fv = tuple(rearrange(t, 'b h i w j d -> b h i (w j) d') for t in (fk, fv))
 
                 # fine attention
@@ -533,12 +748,6 @@ class SparseAttention(Module):
 
                 fine_attn_out = fine_attn_out[..., :seq_len, :]
 
-            # handle maybe gating
-
-            if self.use_diff_topk:
-                gates = gates[..., :seq_len]
-                fine_attn_out = einx.multiply('b h n, b h n d -> b h n d', gates, fine_attn_out)
-
         else:
             # if only first block, just do a simple block causal
 
@@ -549,8 +758,8 @@ class SparseAttention(Module):
 
         # 3. overlapping sliding window, this is unsurprising and expected - `s` for sliding
 
-        sq = rotated_q
-        sk = rotated_k
+        sq = q
+        sk = k
         sv = v
 
         if exists(sliding_window_flex_mask):
@@ -570,4 +779,9 @@ class SparseAttention(Module):
 
         out = self.merge_heads(out)
 
-        return self.combine_heads(out)
+        out = self.combine_heads(out)
+
+        if not return_cache:
+            return out
+
+        return out, (cache_kv, cache_compressed_kv)
