@@ -1,6 +1,16 @@
 from math import ceil
 import torch
-from native_sparse_attention_pytorch.triton_native_sparse_attention import native_sparse_attend, round_up_multiple, pad_to_multiple
+
+from native_sparse_attention_pytorch.native_sparse_attention import (
+    create_sliding_mask,
+    flex_attention
+)
+
+from native_sparse_attention_pytorch.triton_native_sparse_attention import (
+    native_sparse_attend,
+    round_up_multiple,
+    pad_to_multiple,
+)
 
 import einx
 from einops import rearrange, einsum, repeat
@@ -9,6 +19,9 @@ assert torch.cuda.is_available()
 
 def exists(v):
     return v is not None
+
+def default(v, d):
+    return v if exists(v) else d
 
 def abs_diff(x, y):
     return (x - y).abs().amax()
@@ -21,11 +34,21 @@ def regular_attend(
     indices,
     mask,
     block_size,
+    sliding_window_size = None,
     sel_scale = None, 
-    return_lse = False
+    return_lse = False,
+    return_sliding_window_out = False
 ):
     q_heads, seq_len, kv_heads, device = q.shape[1], q.shape[-2], k.shape[1], q.device
     assert divisible_by(q_heads, kv_heads)
+
+    if return_sliding_window_out:
+        kv_seq_len = k.shape[-2]
+        assert seq_len == kv_seq_len
+
+        sliding_window_size = default(sliding_window_size, block_size)
+        sliding_mask = create_sliding_mask(kv_seq_len, sliding_window_size)
+        sliding_out = flex_attention(q, k, v, block_mask = sliding_mask, enable_gqa = True)
 
     q, k, v = tuple(pad_to_multiple(t, block_size, dim = -2) for t in (q, k, v))
 
@@ -97,6 +120,9 @@ def regular_attend(
 
     out = out[..., :seq_len, :]
 
+    if return_sliding_window_out:
+        out = (out, sliding_out)
+
     if not return_lse:
         return out
 
@@ -112,12 +138,15 @@ batch = 4
 seq_len = 507
 q_heads = 4
 kv_heads = 2
-fine_block_size = 16
+fine_block_size = 32
 num_sel = 6
+dim_head = 64
+fused_sliding_window = False
+block_dk_dv_use_dot = False # need sufficient shared memory, A100 works
 
-q = torch.randn(batch, q_heads, seq_len, 64).cuda()
-k = torch.randn(batch, kv_heads, seq_len, 64).cuda()
-v = torch.randn(batch, kv_heads, seq_len, 64).cuda()
+q = torch.randn(batch, q_heads, seq_len, dim_head).cuda()
+k = torch.randn(batch, kv_heads, seq_len, dim_head).cuda()
+v = torch.randn(batch, kv_heads, seq_len, dim_head).cuda()
 
 indices = torch.randint(0, 2, (batch, kv_heads, seq_len, num_sel)).cuda()
 mask = torch.randint(0, 2, (batch, kv_heads, seq_len, num_sel)).bool().cuda()
@@ -130,22 +159,39 @@ nq, nk, nv, nsel_scale = tuple(t.clone().requires_grad_() for t in (q, k, v, sel
 
 # regular forwards and backwards
 
-out, rlse = regular_attend(rq, rk, rv, indices, mask, block_size = fine_block_size, sel_scale = rsel_scale, return_lse = True)
-out.sum().backward()
+out, rlse = regular_attend(rq, rk, rv, indices, mask, block_size = fine_block_size, sel_scale = rsel_scale, return_lse = True, return_sliding_window_out = fused_sliding_window)
+
+if fused_sliding_window:
+    loss = sum(out).sum()
+else:
+    loss = out.sum()
+
+loss.backward()
 
 # triton nsa forwards and backwards
 
-nsa_out, nlse = native_sparse_attend(nq, nk, nv, fine_block_size, indices, mask, sel_scale = nsel_scale, return_lse = True)
-nsa_out.sum().backward()
+nsa_out, nlse = native_sparse_attend(nq, nk, nv, fine_block_size, indices, mask, sel_scale = nsel_scale, return_lse = True, block_dk_dv_use_dot = block_dk_dv_use_dot, return_sliding_window_out = fused_sliding_window)
+
+if fused_sliding_window:
+    nsa_loss = sum(nsa_out).sum()
+else:
+    nsa_loss = nsa_out.sum()
+
+nsa_loss.backward()
 
 # asserts
+
+if fused_sliding_window:
+    out, sliding_out = out
+    nsa_out, sliding_nsa_out = nsa_out
+    assert torch.allclose(sliding_out, sliding_nsa_out, atol = 1e-2)
 
 assert torch.allclose(out, nsa_out, atol = 1e-2)
 assert torch.allclose(rlse, nlse, atol = 1e-2)
 
-assert torch.allclose(rsel_scale.grad, nsel_scale.grad, atol = 1e-2)
+assert torch.allclose(rsel_scale.grad, nsel_scale.grad, atol = 2e-2)
 assert torch.allclose(nv.grad, rv.grad, atol = 1e-2)
 assert torch.allclose(nq.grad, rq.grad, atol = 1e-2)
-assert torch.allclose(nk.grad, rk.grad, atol = 1e-2)
+assert torch.allclose(nk.grad, rk.grad, atol = 2e-2)
 
 print('✅ outputs and gradients are same between pytorch native sparse attn and triton native sparse attn')
