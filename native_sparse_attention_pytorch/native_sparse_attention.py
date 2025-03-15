@@ -675,6 +675,9 @@ class SparseAttention(Module):
         fk = k
         fv = v
 
+        num_selected = min(num_selected, importance_scores.shape[-1])
+        has_selected_kv_for_fine_attn = num_selected > 0
+
         if has_selected_kv_for_fine_attn:
 
             # get the top-n kv segments for fine attention
