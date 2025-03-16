@@ -213,7 +213,6 @@ class SparseAttention(Module):
             compress_block_size,
             selection_block_size,
             num_selected_blocks,
-            kv_heads=None,
             num_compressed_mem_kv=1,
             causal=False,
             norm=True,
@@ -231,12 +230,10 @@ class SparseAttention(Module):
         # attention heads
         # handling gqa if `kv_heads` is set
 
-        kv_heads = default(kv_heads, heads)
-        assert kv_heads <= heads and divisible_by(heads, kv_heads)
+        kv_heads = heads
 
         self.heads = heads
-        self.kv_heads = kv_heads
-        self.num_grouped_queries = heads // kv_heads
+        self.num_grouped_queries = 1
 
         # scale
 
