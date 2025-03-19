@@ -219,7 +219,6 @@ class SparseAttention(Module):
             use_diff_topk=False,
             use_triton_kernel=False,
             interpolated_importance_score=False,
-            query_heads_share_selected_kv=True,
             # if set to True, importance score is averaged across query heads to select top-n buckets of kv per kv head - but can be set to False for each query head within a group to look at different sets of kv buckets. will be more memory and compute of course
             compress_mlp: Module | None = None,
             compress_mlp_expand_factor=1.,
@@ -228,9 +227,7 @@ class SparseAttention(Module):
         super().__init__()
 
         # attention heads
-        # handling gqa if `kv_heads` is set
-
-        kv_heads = heads
+        # You cannot set kv_heads seperately, no more GQA
 
         self.heads = heads
         self.num_grouped_queries = 1
@@ -240,7 +237,6 @@ class SparseAttention(Module):
         self.scale = dim_head ** -0.5
 
         dim_inner = dim_head * heads
-        dim_kv_inner = dim_head * kv_heads
 
         self.norm = nn.RMSNorm(dim) if norm else nn.Identity()
 
@@ -254,7 +250,7 @@ class SparseAttention(Module):
 
         # qkv
 
-        qkv_split = (dim_inner, dim_kv_inner, dim_kv_inner)
+        qkv_split = (dim_inner, dim_inner, dim_inner)
 
         self.to_qkv = nn.Linear(dim, sum(qkv_split), bias=False)
 
@@ -282,10 +278,10 @@ class SparseAttention(Module):
         self.split_compress_window = Rearrange('b h (w n) d -> b h w n d', n=compress_block_size)
 
         self.num_mem_compress_kv = num_compressed_mem_kv
-        self.compress_mem_kv = nn.Parameter(torch.zeros(2, kv_heads, num_compressed_mem_kv, dim_head))
+        self.compress_mem_kv = nn.Parameter(torch.zeros(2, heads, num_compressed_mem_kv, dim_head))
 
-        self.k_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, compress_block_size, dim_head))
-        self.v_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, compress_block_size, dim_head))
+        self.k_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
+        self.v_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
 
         if not exists(compress_mlp):
             compress_dim = compress_block_size * dim_head
@@ -306,8 +302,6 @@ class SparseAttention(Module):
         self.use_diff_topk = use_diff_topk
 
         self.interpolated_importance_score = interpolated_importance_score  # in the case fine block size < compressed block size, will weigh space better when selecting
-
-        self.query_heads_share_selected_kv = query_heads_share_selected_kv
 
         self.selection_block_size = selection_block_size
 
@@ -470,9 +464,6 @@ class SparseAttention(Module):
         fmask = None
 
         if has_selected_kv_for_fine_attn:
-            if self.query_heads_share_selected_kv:
-                importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean',
-                                           grouped_queries=self.num_grouped_queries)
 
             sel_scores, sel_indices = importance_scores.topk(num_selected, dim=-1)
 
@@ -640,15 +631,9 @@ class SparseAttention(Module):
         num_selected = min(self.num_selected_blocks, num_compress_blocks)
         has_selected_kv_for_fine_attn = num_selected > 0
 
-        # maybe average the compressed attention across each grouped queries (per key / values)
+        # No longer needed logic as GQA is not supported in mla
 
-        if self.query_heads_share_selected_kv:
-            importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean',
-                                       grouped_queries=self.num_grouped_queries)
-
-            fine_num_grouped_queries = self.num_grouped_queries
-        else:
-            fine_num_grouped_queries = 1
+        fine_num_grouped_queries = 1
 
         # handle if compress block size does not equal to the fine block size
         # cannot parse their equation, so will just improvise
@@ -778,14 +763,11 @@ class SparseAttention(Module):
 
                 # get_at("b h [w] j d, b h i selected -> b h i selected j d", fkv, selected_block_indices)
 
-                if self.query_heads_share_selected_kv:
-                    fk = repeat(fk, 'b h w j d -> b h i w j d', i=selected_block_indices.shape[2])
-                    fv = repeat(fv, 'b h w j d -> b h i w j d', i=selected_block_indices.shape[2])
-                else:
-                    fk = repeat(fk, 'b h w j d -> b (h qh) i w j d', i=selected_block_indices.shape[2],
-                                qh=self.num_grouped_queries)
-                    fv = repeat(fv, 'b h w j d -> b (h qh) i w j d', i=selected_block_indices.shape[2],
-                                qh=self.num_grouped_queries)
+                # Remove whatever that averaging throughout query head
+                fk = repeat(fk, 'b h w j d -> b (h qh) i w j d', i=selected_block_indices.shape[2],
+                            qh=self.num_grouped_queries)
+                fv = repeat(fv, 'b h w j d -> b (h qh) i w j d', i=selected_block_indices.shape[2],
+                            qh=self.num_grouped_queries)
 
                 selected_block_indices = repeat(selected_block_indices, 'b h i sel -> b h i sel j d', j=fk.shape[-2],
                                                 d=fk.shape[-1])

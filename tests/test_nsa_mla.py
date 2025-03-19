@@ -17,18 +17,10 @@ def test_sparse_attn(
         num_selected_blocks,
         interpolated_importance_score
 ):
-    attn = SparseAttention(
-        dim=512,
-        dim_head=64,
-        heads=8,
-        causal=causal,
-        sliding_window_size=2,
-        compress_block_size=4,
-        selection_block_size=selection_block_size,
-        num_selected_blocks=num_selected_blocks,
-        use_diff_topk=use_diff_topk,
-        interpolated_importance_score=interpolated_importance_score
-    )
+    attn = SparseAttention(dim=512, dim_head=64, heads=8, sliding_window_size=2, compress_block_size=4,
+                           selection_block_size=selection_block_size, num_selected_blocks=num_selected_blocks,
+                           causal=causal, use_diff_topk=use_diff_topk,
+                           interpolated_importance_score=interpolated_importance_score)
 
     tokens = torch.randn(2, seq_len, 512)
     attended = attn(tokens)
