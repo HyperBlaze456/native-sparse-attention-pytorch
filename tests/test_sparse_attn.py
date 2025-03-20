@@ -52,9 +52,11 @@ def test_sparse_attn(
 
 @pytest.mark.parametrize('seq_len', (2, 8, 16))
 @pytest.mark.parametrize('num_selected_blocks', (0, 2))
+@pytest.mark.parametrize('compress_block_overlap_len', (0, 2))
 def test_inference(
     seq_len,
-    num_selected_blocks
+    num_selected_blocks,
+    compress_block_overlap_len
 ):
 
     attn = SparseAttention(
@@ -65,7 +67,8 @@ def test_inference(
         sliding_window_size = 2,
         compress_block_size = 5,
         selection_block_size = 10,
-        num_selected_blocks = num_selected_blocks
+        num_selected_blocks = num_selected_blocks,
+        compress_block_overlap_len = compress_block_overlap_len
     )
 
     tokens = torch.randn(2, seq_len, 512)
@@ -82,3 +85,27 @@ def test_inference(
     sequential_out = torch.cat(sequential_out, dim = 1)
 
     assert torch.allclose(parallel_out, sequential_out, atol = 1e-5)
+
+def test_transformer_inference():
+    from native_sparse_attention_pytorch.transformer import Transformer
+
+    model = Transformer(
+        num_tokens = 256,
+        dim = 512,
+        depth = 2,
+        causal = True,
+        use_sparse_attn = True,
+        sparse_attn_kwargs = dict(
+            sliding_window_size = 16,
+            compress_block_size = 4,
+            selection_block_size = 16,
+            num_selected_blocks = 1
+        )
+    )
+
+    prompt = torch.randint(0, 256, (1, 1))
+
+    sampled = model.sample(prompt, 25, temperature = 0., use_cache_kv = False)
+    sampled_cached = model.sample(prompt, 25, temperature = 0., use_cache_kv = True)
+
+    assert torch.allclose(sampled, sampled_cached)
