@@ -184,6 +184,8 @@ nsa_loss.backward()
 if fused_sliding_window:
     out, sliding_out = out
     nsa_out, sliding_nsa_out = nsa_out
+
+    nlse, _ = nlse
     assert torch.allclose(sliding_out, sliding_nsa_out, atol = 1e-2)
 
 assert torch.allclose(out, nsa_out, atol = 1e-2)

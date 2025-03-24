@@ -145,13 +145,6 @@ def pad_at_dim(t, pad, dim = -1, value = 0.):
     zeros = ((0, 0) * dims_from_right)
     return F.pad(t, (*zeros, *pad), value = value)
 
-def interpolate_1d(x, length, mode = 'bilinear'):
-    x, inverse_pack = pack_one_with_inverse(x, '* n')
-    x = rearrange(x, 'b n -> b 1 n 1')
-    x = F.interpolate(x, (length, 1), mode = mode)
-    x = rearrange(x, 'b 1 n 1 -> b n')
-    return inverse_pack(x)
-
 def straight_through(t, target):
     return t + (target - t).detach()
 
@@ -209,7 +202,6 @@ class SparseAttention(Module):
         norm = True,
         use_diff_topk = False,
         use_triton_kernel = False,
-        interpolated_importance_score = False,
         query_heads_share_selected_kv = True, # if set to True, importance score is averaged across query heads to select top-n buckets of kv per kv head - but can be set to False for each query head within a group to look at different sets of kv buckets. will be more memory and compute of course
         compress_mlp: Module | None = None,
         compress_mlp_expand_factor = 1.,
@@ -290,7 +282,7 @@ class SparseAttention(Module):
         self.split_compress_window = split_compress_window_fn
         self.compress_window_size = compress_window_size
 
-        assert compress_block_overlap_len < compress_block_size
+        assert compress_block_overlap_len <= compress_block_size
         self.compress_block_overlap_len = compress_block_overlap_len
 
         # compression attention related parameters
@@ -319,9 +311,9 @@ class SparseAttention(Module):
 
         self.use_diff_topk = use_diff_topk
 
-        self.interpolated_importance_score = interpolated_importance_score # in the case fine block size < compressed block size, will weigh space better when selecting
-
         self.query_heads_share_selected_kv = query_heads_share_selected_kv
+
+        assert divisible_by(selection_block_size, compress_block_size), f'selection block size {selection_block_size} must be greater than or equal to compress block size {compress_block_size}, as well as divisible by the compress block size'
 
         self.selection_block_size = selection_block_size
 
@@ -469,19 +461,12 @@ class SparseAttention(Module):
         importance_scores = csim[..., self.num_mem_compress_kv:]
 
         num_compress_blocks = importance_scores.shape[-1]
+        num_compress_per_fine = self.selection_block_size // self.compress_block_size
 
         if self.compress_block_size != self.selection_block_size:
-            compress_seq_len = num_compress_blocks * self.compress_block_size
-
-            if self.interpolated_importance_score:
-                importance_scores = interpolate_1d(importance_scores, compress_seq_len)
-            else:
-                importance_scores = repeat(importance_scores, '... j -> ... (bsz j)', bsz = self.compress_block_size)
-
-            fine_seq_len = round_down_mult(compress_seq_len, self.selection_block_size)
-
-            importance_scores = importance_scores[..., :fine_seq_len]
-            importance_scores = reduce(importance_scores, '... (bsz j) -> ... j', 'mean', bsz = self.selection_block_size)
+            compress_seq_len = round_down_mult(num_compress_blocks, num_compress_per_fine)
+            importance_scores = importance_scores[..., :compress_seq_len]
+            importance_scores = reduce(importance_scores, '... (j num_compress_per_fine) -> ... j', 'mean', num_compress_per_fine = num_compress_per_fine)
 
         num_fine_blocks = importance_scores.shape[-1]
         num_selected = min(self.num_selected_blocks, num_fine_blocks)
@@ -501,7 +486,9 @@ class SparseAttention(Module):
             if self.query_heads_share_selected_kv:
                 importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
 
+            importance_scores = F.pad(importance_scores, (1, 0), value = -1e3)
             importance_scores = importance_scores.softmax(dim = -1)
+            importance_scores = importance_scores[..., 1:]
 
             sel_scores, sel_indices = importance_scores.topk(num_selected, dim = -1)
     
@@ -599,6 +586,7 @@ class SparseAttention(Module):
         num_compress_blocks = compress_divisible_seq_len // self.compress_block_size
 
         compress_overlap_len = self.compress_block_overlap_len
+        has_compress_overlap = compress_overlap_len > 0
 
         fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
         num_fine_blocks = fine_divisible_seq_len // self.selection_block_size
@@ -631,9 +619,9 @@ class SparseAttention(Module):
 
         run_k, run_v = k, v
 
-        if return_cache and compress_overlap_len > 0:
-            run_k = F.pad(run_k, (0, 0, compress_overlap_len, 0), value = 0.)
-            run_v = F.pad(run_v, (0, 0, compress_overlap_len, 0), value = 0.)
+        if return_cache and has_compress_overlap:
+            run_k = pad_at_dim(run_k, (compress_overlap_len, 0), value = 0., dim = -2)
+            run_v = pad_at_dim(run_v, (compress_overlap_len, 0), value = 0., dim = -2)
 
         run_k = run_k[..., compress_divisible_seq_len:, :]
         run_v = run_v[..., compress_divisible_seq_len:, :]
@@ -700,29 +688,24 @@ class SparseAttention(Module):
 
             if self.compress_block_size != self.selection_block_size:
 
-                compress_seq_len = num_compress_blocks * self.compress_block_size
+                num_compress_per_fine = self.selection_block_size // self.compress_block_size
 
-                if self.interpolated_importance_score:
-                    importance_scores = interpolate_1d(importance_scores, compress_seq_len)
-                else:
-                    importance_scores = repeat(importance_scores, '... j -> ... (j block_size)', block_size = self.compress_block_size)
+                round_down_score_len = round_down_mult(importance_scores.shape[-1], num_compress_per_fine)
+                importance_scores = importance_scores[..., :round_down_score_len]
 
-                padding = fine_divisible_seq_len - compress_seq_len
+                if not is_empty(importance_scores):
+                    importance_scores = reduce(importance_scores, '... (j num_compress_per_fine) -> ... j', 'mean', num_compress_per_fine = num_compress_per_fine)
 
-                fine_query_seq_len = importance_scores.shape[-2]
-                fine_query_padding = fine_divisible_seq_len - importance_scores.shape[-2]
+                    i, j = importance_scores.shape[-2:]
 
-                importance_scores = F.pad(importance_scores, (0, padding))
+                    # mask out block diagonal
 
-                # mask out the diagonal since block causal is included by default for fine attending
+                    q_seq = arange(i, device = device) // self.selection_block_size
+                    k_seq = arange(j, device = device)
 
-                block_causal_mask = torch.ones((num_fine_blocks,) * 2, device = device, dtype = torch.bool).tril(-1)
-                block_causal_mask = repeat(block_causal_mask, 'i j -> (i n1) (j n2)', n1 = self.selection_block_size, n2 = self.selection_block_size)
-                block_causal_mask = block_causal_mask[:fine_query_seq_len]
+                    block_diagonal_mask = einx.equal('i, j -> i j', q_seq, k_seq)
 
-                importance_scores = importance_scores.masked_fill(~block_causal_mask, max_neg_value(csim))
-
-                importance_scores = reduce(importance_scores, '... (j block_size) -> ... j', 'mean', block_size = self.selection_block_size)
+                    importance_scores = importance_scores.masked_fill(block_diagonal_mask, max_neg_value(csim))
 
             importance_scores = F.pad(importance_scores, (1, 0), value = -1e3)
             importance_scores = importance_scores.softmax(dim = -1)

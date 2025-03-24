@@ -10,12 +10,11 @@ from native_sparse_attention_pytorch import SparseAttention
 @pytest.mark.parametrize('causal', (False, True))
 @pytest.mark.parametrize('seq_len', (1, 4, 31, 32, 120))
 @pytest.mark.parametrize('kv_heads', (8, 4))
-@pytest.mark.parametrize('selection_block_size', (8, 4, 2))
+@pytest.mark.parametrize('selection_block_size', (8, 16, 32))
 @pytest.mark.parametrize('compress_block_size', (8, 4))
 @pytest.mark.parametrize('compress_block_overlap_len', (0, 2))
 @pytest.mark.parametrize('num_selected_block', (0, 2))
 @pytest.mark.parametrize('query_heads_share_selected_kv', (False, True))
-@pytest.mark.parametrize('interpolated_importance_score', (False, True))
 def test_sparse_attn(
     use_diff_topk,
     causal,
@@ -26,7 +25,6 @@ def test_sparse_attn(
     compress_block_overlap_len,
     num_selected_block,
     query_heads_share_selected_kv,
-    interpolated_importance_score
 ):
     attn = SparseAttention(
         dim = 512,
@@ -41,7 +39,6 @@ def test_sparse_attn(
         num_selected_blocks = num_selected_block,
         use_diff_topk = use_diff_topk,
         query_heads_share_selected_kv = query_heads_share_selected_kv,
-        interpolated_importance_score = interpolated_importance_score
     )
 
     tokens = torch.randn(2, seq_len, 512)
@@ -53,10 +50,12 @@ def test_sparse_attn(
 @pytest.mark.parametrize('seq_len', (2, 8, 16))
 @pytest.mark.parametrize('num_selected_blocks', (0, 2))
 @pytest.mark.parametrize('compress_block_overlap_len', (0, 2))
+@pytest.mark.parametrize('selection_block_size', (5, 10, 15))
 def test_inference(
     seq_len,
     num_selected_blocks,
-    compress_block_overlap_len
+    compress_block_overlap_len,
+    selection_block_size
 ):
 
     attn = SparseAttention(
@@ -66,7 +65,7 @@ def test_inference(
         causal = True,
         sliding_window_size = 2,
         compress_block_size = 5,
-        selection_block_size = 10,
+        selection_block_size = selection_block_size,
         num_selected_blocks = num_selected_blocks,
         compress_block_overlap_len = compress_block_overlap_len
     )
@@ -86,7 +85,10 @@ def test_inference(
 
     assert torch.allclose(parallel_out, sequential_out, atol = 1e-5)
 
-def test_transformer_inference():
+@pytest.mark.parametrize('selection_block_size', (4, 8))
+def test_transformer_inference(
+    selection_block_size
+):
     from native_sparse_attention_pytorch.transformer import Transformer
 
     model = Transformer(
@@ -98,14 +100,14 @@ def test_transformer_inference():
         sparse_attn_kwargs = dict(
             sliding_window_size = 16,
             compress_block_size = 4,
-            selection_block_size = 16,
-            num_selected_blocks = 1
+            selection_block_size = selection_block_size,
+            num_selected_blocks = 2
         )
     )
 
     prompt = torch.randint(0, 256, (1, 1))
 
-    sampled = model.sample(prompt, 25, temperature = 0., use_cache_kv = False)
-    sampled_cached = model.sample(prompt, 25, temperature = 0., use_cache_kv = True)
+    sampled = model.sample(prompt, 128, temperature = 0., use_cache_kv = False)
+    sampled_cached = model.sample(prompt, 128, temperature = 0., use_cache_kv = True)
 
     assert torch.allclose(sampled, sampled_cached)
