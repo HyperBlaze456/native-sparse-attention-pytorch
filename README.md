@@ -16,6 +16,8 @@ This will be my last open sourced project under Meta
 
 - <a href="https://github.com/Pasewark">Eric Pasewark</a> for submitting a simple transformer based compression network
 
+- <a href="https://github.com/Mr-Grin">@Mr-Grin</a> for a pull request that fixes compression block hyperparameters
+
 ## Install
 
 ```bash
@@ -34,6 +36,7 @@ attn = SparseAttention(
     heads = 8,
     sliding_window_size = 2,
     compress_block_size = 4,
+    compress_block_sliding_stride = 2,
     selection_block_size = 4,
     num_selected_blocks = 2
 )
